@@ -1,0 +1,234 @@
+---
+title: "Data Science Porject: Facebook V: Predicting Check Ins"
+author: "Yiyang Zhang"
+date: "May 8, 2022"
+output:
+---
+
+In this competition we're given around 30 million (simulated) check-ins on Facebook in a 10km by 10km grid. The goal is to build a model that predicts what business a user checks into based on spatial and temporal information. The tricky part here is that there are around 100k different classes(`place_id`) so most supervised learning techniques won't work on the entire dataset. However most classes are clustered in only certain parts of the grid so the idea we will pursue here is to select a small-ish square within the grid and try to see if we can do better within the small square. First we will do some exploratory data analysis in the smaller square then we will use a random forest algorithm for prediction and finally, we will analyze the results.
+
+### Read and Clean Data:
+
+Load the required packages and read in the data:
+
+```{r, message = FALSE, warning = FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ranger)
+library(plotly)
+library(tidyr)
+library(FNN)
+library(xgboost)
+library(corrplot)
+library(gridExtra)
+
+train = fread("train.csv", integer64 = "character", showProgress = FALSE)
+summary(train)
+```
+
+Now we'll select a subset of the data, because the dataset is extremely large. I'll pick a random 250 meters by 250 meters square in our imaginary Facebook city.
+
+```{r}
+train %>% filter(x >1, x <1.25, y >2.5, y < 2.75) -> train
+head(train, 3)
+```
+
+### EDA(Exploratory DATA Analysis):
+
+```{r}
+
+week = 60 * 24 * 7
+train$week <- floor(train$time / week)
+weekstats <- train %>% group_by(week) %>%
+  summarize(
+    acc_mean = mean(accuracy), checkins = length(row_id)
+  )
+
+  acc_byWeek <- ggplot(weekstats, aes(x = week, y = acc_mean)) + geom_line(size=2, col=1) + labs(y="Mean Accuracy")
+  acc_dens <- ggplot(train, aes(x = accuracy)) + geom_density()
+  grid.arrange(acc_byWeek, acc_dens, ncol=2)
+  
+```
+We do not know these peaks in mean accuracy either in time or in the distribution, Some seem to be related. Thus, we will look at how the accuracy by week compares to the number of check in’s per week. We will normalize each variable to show it on the same axis:
+
+```{r}
+
+weekstats <- weekstats %>% scale %>% as.data.frame %>% melt(id="week")
+ggplot(weekstats, aes(x = week, y = value, color=variable)) + geom_line(size=2) + scale_color_discrete(breaks=c("checkins","acc_mean"), labels=c("Number of Checkins", "Mean Accuracy")) + ylab("normalized value")
+
+```
+
+Time is only given simply as a numeric value. For the purpose of clear observation and understanding, let's extract a new feature called `hour` that gives the hour in the day (from 0 to 24). At the same time, extract (approximations) of other time units such as `weekday`, `month` and `year`.
+
+```{r}
+train$hour = (train$time/60) %% 24
+train$weekday = (train$time/(60*24)) %% 7
+train$month = (train$time/(60*24*30)) %% 12
+train$year = train$time/(60*24*365)
+train$day = train$time/(60*24) %% 365
+
+```
+
+We will use holdup sample method to split our dataset into a training and validating set so we can check the results. We choose the validation set to be the more recent check-ins so that our validation structure is similar to the one on the test set.
+
+```{r}
+small_train = train[train$time < 7.3e5,]
+small_val = train[train$time >= 7.3e5,] 
+```
+
+
+Distribution of data grouped by place_id:
+ 
+```{r, fig.height = 8, fig.width = 10}
+ggplot(small_train, aes(x, y )) +
+    geom_point(aes(color = place_id)) + 
+    theme_minimal() +
+    theme(legend.position = "none") +
+    ggtitle("Check-ins colored by place_id")
+```
+
+Now we can see the rough distribution of the data sorted by place_id. But some of the groups are overlapping and it is hard to identify certain characteristics. We will use the hour component as the third variable and to juse have a look at the most popular clusters to get a more reasonable observation.
+
+```{r, fig.height = 8, fig.width = 8}
+small_train %>% count(place_id) %>% filter(n > 500) -> ids
+small_trainz = small_train[small_train$place_id %in% ids$place_id,]
+summary(small_trainz)
+
+plot_ly(data = small_trainz, x = ~x , y = ~y , z = ~hour, color = ~place_id,  type = "scatter3d", mode = "markers", marker=list(size= 5)) %>% layout(title = "Place_id's by position and Time of Day")
+
+```
+
+We can see that adding the time dimension definitely helps. The daily cycles are clearly visible above - for certain places the check-in's stop for a few hours and then start peaking up again. Other businesses have quite a few peaks throughout the day, and the peaks tend to be rather different for different businesses.
+
+Construct another one at the day of week:
+```{r}
+plot_ly(data = small_trainz, x = ~x , y = ~y, z = ~weekday, color = ~place_id,  type = "scatter3d", mode = "markers", marker=list(size= 5)) %>% layout(title = "Place_id's by position and Day of Week")
+
+```
+
+There is some variation by day of week (perhaps some businesses are busier on the weekend) but the most visible trend is still the day cycles.
+
+However we still might have too many classes for something like random forest to work at its best.
+
+```{r}
+length(unique(small_train$place_id))
+```
+
+Then, we will remove the `place_id`'s that have only three or less occurrences in the city are we picked. This will decrease the number of classes by a lot. Since we have a validation set we can always come back and change the filter level to see if we get better results.
+
+```{r}
+small_train %>% count(place_id) %>% filter(n > 3) -> ids
+small_train = small_train[small_train$place_id %in% ids$place_id,]
+```
+
+Now we have **`r nrow(small_train)`** training examples and **`r nrow(ids)`** classes and we're ready to do some machine learning!
+
+
+### K Nearest Neighbors
+
+KNN can be used for classification in a supervised setting where we are given a dataset with target labels. For classification, KNN finds the k nearest data points in the training set and the target label is computed as the mode of the target label of these k nearest neighbors.
+
+WHY KNN?
+  * Simple to implement and intuitive to understand
+  * Can learn non-linear decision boundaries when used for classification and regression. Can came up with a highly flexible decision boundary adjusting the value of K.
+  * No Training Time for classification/regression : The KNN algorithm has no explicit training step and all the work happens during prediction
+  * Constantly evolves with new data: Since there is no explicit training step, as we keep adding new data to the dataset, the prediction is adjusted without having to     retrain a new model.
+  * Single Hyper parameters: There is a single hyper parameter, the value of K. This makes hyper parameter tuning easy.
+  * Choice of distance metric: There are many distance metrics to chose from. Some popular distance metrics used are Euclidean, Manhattan, Minkowski, hamming distance eand so on.
+
+```{r}
+s = 2
+l = 125
+w = 500
+
+create_matrix = function(train) {
+    cbind(s*train$y,
+          train$x,
+          train$hour/l,
+          train$weekday/w,
+          train$year/w,
+          train$month/w,
+          train$time/(w*60*24*7))
+    }
+
+X = create_matrix(small_train)
+X_val = create_matrix(small_val)
+
+```
+
+Now we will build the knn model
+
+```{r}
+model_knn = FNN::knn(train = X, test = X_val, cl = small_train$place_id, k = 15)
+
+preds <- as.character(model_knn)
+truth <- as.character(small_val$place_id)
+mean(truth == preds)
+```
+
+We can see that knn did not perform very well in this circumstance, let's try to use Random Forest instead.
+
+### Random Forest:
+
+```{r}
+set.seed(2022)
+small_train$place_id <- as.factor(small_train$place_id) # ranger needs factors for classification
+model_rf <- ranger(place_id ~ x + y + accuracy + hour + weekday + month + year,
+                   small_train,
+                   num.trees = 100,
+                   write.forest = TRUE,
+                   importance = "impurity")
+
+
+pred = predict(model_rf, small_val)
+pred = pred$predictions
+accuracy = mean(pred == small_val$place_id)
+```
+
+
+We get an accuracy of **`r accuracy`**. The accuracy improves compared with knn, but it is not that good. Because the evaluation metric for this competition is mean average precision at 3 so predicting votes/probabilities by class and then counting the top three id's is guaranteed to improve our score. But for simplicity we'll just stick to accuracy.
+
+Then we will take a look at the predictions on the validation set:
+
+```{r}
+small_val$Correct = (pred == small_val$place_id)
+
+ggplot(small_val, aes(x, y )) +
+    geom_point(aes(color = Correct)) + 
+    theme_minimal() +
+    scale_color_brewer(palette = "Set1")
+```
+
+It does seem that the correctly identified check-ins are more "clustered" while the wrongly identified ones are more uniformly distributed but other than that no clear patters here.
+Let's also take a look at what kind of id's the random forest model gets wrong. To do this we will look at accuracy by id and also plot the id's based on how often they appear in the validation set. We see below that our model is doing actually really great on the more popular id's(more blue on the right). However it loses when it looks at id's that appear only a few times. 
+
+```{r, fig.width = 12}
+#reordering the levels based on counts:
+small_val$place_id <- factor(small_val$place_id,
+                             levels = names(sort(table(small_val$place_id), decreasing = TRUE)))
+
+small_val %>% 
+    ggplot(aes(x = place_id)) + geom_bar(aes(fill = Correct)) + 
+    theme_minimal() +
+    theme(axis.text.x = element_blank()) +
+    ggtitle("Prediction Accuracy by ID and Popularity") +
+    scale_fill_brewer(palette = "Set1")
+```
+
+We see above that our model is doing actually really good on the more popular id's. However it loses when it looks at id's that appear only a few times.  
+ 
+Let's look at the importance of our variables as well:
+
+```{r}
+data.frame(as.list(model_rf$variable.importance)) %>% gather() %>% 
+    ggplot(aes(x = reorder(key, value), y = value)) +
+    geom_bar(stat = "identity", width = 0.6, fill = "grey") +
+    coord_flip() +
+    theme_minimal() +
+    ggtitle("Variable Importance (Gini Index)") +
+    theme(axis.title.y = element_blank()) 
+
+```
+
+All the `y` variable is more important than the `x` coordinate. This means that the `y` axis is a better predictor of `place_id` and the random forest figures this out on its own. `hour` and other time features are also good predictors but less so than the spatial features, this makes sense since the location of a check-in should be more important than the time of the check-in. And lastly , it is interesting that we can see accuracy is not that important here.
